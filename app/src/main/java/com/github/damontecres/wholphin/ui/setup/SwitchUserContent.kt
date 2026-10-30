@@ -58,6 +58,7 @@ import kotlinx.coroutines.launch
 fun SwitchUserContent(
     server: JellyfinServer,
     modifier: Modifier = Modifier,
+    promptUser: JellyfinUser? = null,
     viewModel: SwitchUserViewModel =
         hiltViewModel<SwitchUserViewModel, SwitchUserViewModel.Factory>(
             creationCallback = { it.create(server) },
@@ -117,6 +118,17 @@ fun SwitchUserContent(
         }
     }
     var switchUserWithPin by remember { mutableStateOf<JellyfinUser?>(null) }
+
+    LaunchedEffect(promptUser?.id, state.loading) {
+        if (state.loading == LoadingState.Success && promptUser != null) {
+            // Use the fresh stored credentials, rather than a pre-screensaver PIN snapshot.
+            val user = state.users.firstOrNull { it.user.id == promptUser.id }?.user
+            if (user != null) {
+                if (user.requireLogin || user.accessToken == null) showAddUserDialog(user)
+                else if (user.hasPin) switchUserWithPin = user
+            }
+        }
+    }
 
     when (val st = state.loading) {
         is LoadingState.Error -> {

@@ -29,6 +29,11 @@ import com.github.damontecres.wholphin.services.LatestNextUpService
 import com.github.damontecres.wholphin.ui.SlimItemFields
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withContext
+import com.github.damontecres.wholphin.util.WholphinDispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.firstOrNull
 import org.jellyfin.sdk.api.client.ApiClient
 import org.jellyfin.sdk.api.client.exception.ApiClientException
@@ -57,29 +62,37 @@ class TvProviderWorker
         @Assisted workerParams: WorkerParameters,
         private val serverRepository: ServerRepository,
         private val preferences: DataStore<AppPreferences>,
-        private val api: ApiClient,
         private val latestNextUpService: LatestNextUpService,
-        private val imageUrlService: ImageUrlService,
     ) : CoroutineWorker(context, workerParams) {
-        override suspend fun doWork(): Result {
+        private lateinit var workerApi: ApiClient
+        private lateinit var workerImages: ImageUrlService
+
+        override suspend fun doWork(): Result = runWork()
+
+        private suspend fun canPublish(serverId: UUID, userId: UUID): Boolean {
+            val user = serverRepository.serverDao.getUser(serverId, userId)
+            val prefs = preferences.data.firstOrNull() ?: return false
+            return user != null && !user.isProtected &&
+                prefs.currentServerId.toUUIDOrNull() == serverId &&
+                prefs.currentUserId.toUUIDOrNull() == userId
+        }
+
+        private suspend fun runWork(): Result {
             Timber.d("Start")
             val serverId =
                 inputData.getString(PARAM_SERVER_ID)?.toUUIDOrNull() ?: return Result.failure()
             val userId =
                 inputData.getString(PARAM_USER_ID)?.toUUIDOrNull() ?: return Result.failure()
 
-            if (api.baseUrl.isNullOrBlank() || api.accessToken.isNullOrBlank()) {
-                // Not active
-                var currentUser = serverRepository.current.value
-                if (currentUser == null) {
-                    serverRepository.restoreSession(serverId, userId)
-                    currentUser = serverRepository.current.value
-                }
-                if (currentUser == null) {
-                    Timber.w("No user found during run")
-                    return Result.failure()
-                }
+            // Never restore the foreground session or borrow its mutable credentials.
+            if (!canPublish(serverId, userId)) {
+                clearPrograms(context)
+                return Result.success()
             }
+            val server = serverRepository.serverDao.getServer(serverId)?.server ?: return Result.success()
+            val user = serverRepository.serverDao.getUser(serverId, userId) ?: return Result.success()
+            workerApi = serverRepository.jellyfin.createApi(baseUrl = server.url, accessToken = user.accessToken)
+            workerImages = ImageUrlService(workerApi)
             try {
                 val prefs = preferences.data.firstOrNull() ?: AppPreferences.getDefaultInstance()
                 val potentialItemsToAdd =
@@ -88,57 +101,65 @@ class TvProviderWorker
                         prefs.homePagePreferences.enableRewatchingNextUp,
                         prefs.homePagePreferences.maxDaysNextUp,
                     )
-                val potentialItemsToAddIds = potentialItemsToAdd.map { it.id.toString() }
-
-                Timber.v("potentialItemsToAddIds=%s", potentialItemsToAddIds)
-                val currentItems = getCurrentTvChannelNextUp()
-                val currentItemIds = currentItems.map { it.internalProviderId }
-
-                // TODO Remove after v0.6.5 release
-                // This cleans up movies that are using the poster image, see https://github.com/damontecres/Wholphin/issues/1425
-                currentItems
-                    .filter {
-                        it.type == WatchNextPrograms.TYPE_MOVIE &&
-                            it.posterArtUri
-                                .toString()
-                                .lowercase()
-                                .contains("primary")
-                    }.map { TvContractCompat.buildWatchNextProgramUri(it.id) }
-                    .forEach {
-                        context.contentResolver.delete(it, null, null)
+                publicationMutex.withLock {
+                    if (!canPublish(serverId, userId)) {
+                        clearProgramsUnlocked(context)
+                        return Result.success()
                     }
-                // End temporary clean up
+                    val potentialItemsToAddIds = potentialItemsToAdd.map { it.id.toString() }
 
-                val toRemove =
-                    currentItems.filterNot { it.internalProviderId in potentialItemsToAddIds }
+                    Timber.v("potentialItemsToAddIds=%s", potentialItemsToAddIds)
+                    val currentItems = getCurrentTvChannelNextUp()
+                    val currentItemIds = currentItems.map { it.internalProviderId }
 
-                val userRemoved = currentItems.filterNot { it.isBrowsable }
-                val userRemovedIds = userRemoved.map { it.internalProviderId }
-                Timber.v("toRemove (%s)=%s", toRemove.size, toRemove.map { it.internalProviderId })
-                val toAdd =
-                    potentialItemsToAdd.filter { it.id.toString() !in currentItemIds && it.id.toString() !in userRemovedIds }
-                Timber.v("toAdd (%s)=%s", toAdd.size, toAdd.map { it.id })
+                    // TODO Remove after v0.6.5 release
+                    // This cleans up movies that are using the poster image, see https://github.com/damontecres/Wholphin/issues/1425
+                    currentItems
+                        .filter {
+                            it.type == WatchNextPrograms.TYPE_MOVIE &&
+                                it.posterArtUri
+                                    .toString()
+                                    .lowercase()
+                                    .contains("primary")
+                        }.map { TvContractCompat.buildWatchNextProgramUri(it.id) }
+                        .forEach {
+                            context.contentResolver.delete(it, null, null)
+                        }
+                    // End temporary clean up
 
-                // Remove existing items if they are no longer in the next up from server
-                (toRemove + userRemoved)
-                    .map { TvContractCompat.buildWatchNextProgramUri(it.id) }
-                    .forEach {
-                        context.contentResolver.delete(it, null, null)
-                    }
+                    val toRemove =
+                        currentItems.filterNot { it.internalProviderId in potentialItemsToAddIds }
 
-                // Add new ones
-                val addedCount =
-                    context.contentResolver.bulkInsert(
-                        WatchNextPrograms.CONTENT_URI,
-                        toAdd
-                            .map { convert(it).toContentValues() }
-                            .toTypedArray(),
-                    )
-                Timber.v("Added %s", addedCount)
+                    val userRemoved = currentItems.filterNot { it.isBrowsable }
+                    val userRemovedIds = userRemoved.map { it.internalProviderId }
+                    Timber.v("toRemove (%s)=%s", toRemove.size, toRemove.map { it.internalProviderId })
+                    val toAdd =
+                        potentialItemsToAdd.filter { it.id.toString() !in currentItemIds && it.id.toString() !in userRemovedIds }
+                    Timber.v("toAdd (%s)=%s", toAdd.size, toAdd.map { it.id })
 
-                addOtherChannels()
+                    // Remove existing items if they are no longer in the next up from server
+                    (toRemove + userRemoved)
+                        .map { TvContractCompat.buildWatchNextProgramUri(it.id) }
+                        .forEach {
+                            context.contentResolver.delete(it, null, null)
+                        }
+
+                    // Add new ones
+                    val addedCount =
+                        context.contentResolver.bulkInsert(
+                            WatchNextPrograms.CONTENT_URI,
+                            toAdd
+                                .map { convert(it).toContentValues() }
+                                .toTypedArray(),
+                        )
+                    Timber.v("Added %s", addedCount)
+
+                }
+                addOtherChannels(serverId, userId)
 
                 Timber.d("Completed successfully")
+            } catch (ex: CancellationException) {
+                throw ex
             } catch (_: ApiClientException) {
                 return Result.retry()
             } catch (_: Exception) {
@@ -152,11 +173,11 @@ class TvProviderWorker
             enableRewatching: Boolean,
             maxDaysNextUp: Int,
         ): List<BaseItem> {
-            val resumeItems = latestNextUpService.getResume(userId, 10, true)
+            val resumeItems = latestNextUpService.getResume(userId, 10, true, apiClient = workerApi)
             val seriesIds = resumeItems.mapNotNull { it.data.seriesId }
             val nextUpItems =
                 latestNextUpService
-                    .getNextUp(userId, 10, enableRewatching, false, maxDaysNextUp)
+                    .getNextUp(userId, 10, enableRewatching, false, maxDaysNextUp, apiClient = workerApi)
                     .filter { it.data.seriesId != null && it.data.seriesId !in seriesIds }
             return latestNextUpService.buildCombined(resumeItems, nextUpItems)
         }
@@ -223,7 +244,7 @@ class TvProviderWorker
                             BaseItemKind.EPISODE -> ImageType.THUMB
                             else -> if (ImageType.THUMB in item.data.imageTags.orEmpty()) ImageType.THUMB else ImageType.PRIMARY
                         }
-                    setPosterArtUri(imageUrlService.getItemImageUrl(item, imageType)!!.toUri())
+                    setPosterArtUri(workerImages.getItemImageUrl(item, imageType)!!.toUri())
 
                     setIntent(
                         Intent(context, MainActivity::class.java)
@@ -256,12 +277,12 @@ class TvProviderWorker
                     )
                 }.build()
 
-        private suspend fun addOtherChannels() {
+        private suspend fun addOtherChannels(serverId: UUID, userId: UUID) {
             val preferences = preferences.data.firstOrNull()
             val channelsPrefs = context.getSharedPreferences("channels", Context.MODE_PRIVATE)
 
             val latest =
-                api.userLibraryApi
+                workerApi.userLibraryApi
                     .getLatestMedia(
                         GetLatestMediaRequest(
                             fields = SlimItemFields,
@@ -277,45 +298,51 @@ class TvProviderWorker
                     ).content
                     .map { BaseItem(it, true) }
 
-            var channelId = channelsPrefs.getString("latest", null)?.toUri()
-            if (channelId == null) {
-                Timber.d("channelId for latest is null")
-                val channel =
-                    Channel
-                        .Builder()
-                        .apply {
-                            setDisplayName(context.getString(R.string.recently_added))
-                            setType(Channels.TYPE_PREVIEW)
-                            setAppLinkIntent(Intent(context, MainActivity::class.java))
-                        }.build()
-                channelId =
-                    context.contentResolver.insert(
-                        Channels.CONTENT_URI,
-                        channel.toContentValues(),
-                    )
-                if (channelId != null) {
-                    channelsPrefs.edit(true) {
-                        putString("latest", channelId.toString())
-                    }
-                    TvContractCompat.requestChannelBrowsable(
-                        context,
-                        ContentUris.parseId(channelId),
-                    )
-                } else {
-                    Timber.w("channelId was null")
-                    throw IllegalStateException("channelId was null")
+            publicationMutex.withLock {
+                if (!canPublish(serverId, userId)) {
+                    clearProgramsUnlocked(context)
+                    return
                 }
-            }
-            val programs = latest.map { convert(channelId, it).toContentValues() }.toTypedArray()
+                var channelId = channelsPrefs.getString("latest", null)?.toUri()
+                if (channelId == null) {
+                    Timber.d("channelId for latest is null")
+                    val channel =
+                        Channel
+                            .Builder()
+                            .apply {
+                                setDisplayName(context.getString(R.string.recently_added))
+                                setType(Channels.TYPE_PREVIEW)
+                                setAppLinkIntent(Intent(context, MainActivity::class.java))
+                            }.build()
+                    channelId =
+                        context.contentResolver.insert(
+                            Channels.CONTENT_URI,
+                            channel.toContentValues(),
+                        )
+                    if (channelId != null) {
+                        channelsPrefs.edit(true) {
+                            putString("latest", channelId.toString())
+                        }
+                        TvContractCompat.requestChannelBrowsable(
+                            context,
+                            ContentUris.parseId(channelId),
+                        )
+                    } else {
+                        Timber.w("channelId was null")
+                        throw IllegalStateException("channelId was null")
+                    }
+                }
+                val programs = latest.map { convert(channelId, it).toContentValues() }.toTypedArray()
 
-            // Delete & replace
-            context.contentResolver.delete(TvContractCompat.PreviewPrograms.CONTENT_URI, null, null)
-            val count =
-                context.contentResolver.bulkInsert(
-                    TvContractCompat.PreviewPrograms.CONTENT_URI,
-                    programs,
-                )
-            Timber.v("Inserted $count records")
+                // Delete & replace
+                context.contentResolver.delete(TvContractCompat.PreviewPrograms.CONTENT_URI, null, null)
+                val count =
+                    context.contentResolver.bulkInsert(
+                        TvContractCompat.PreviewPrograms.CONTENT_URI,
+                        programs,
+                    )
+                Timber.v("Inserted $count records")
+            }
         }
 
         private fun convert(
@@ -360,7 +387,7 @@ class TvProviderWorker
                     }
 
                     setPosterArtAspectRatio(TvContractCompat.PreviewProgramColumns.ASPECT_RATIO_16_9)
-                    setPosterArtUri(imageUrlService.getItemImageUrl(item, ImageType.THUMB)!!.toUri())
+                    setPosterArtUri(workerImages.getItemImageUrl(item, ImageType.THUMB)!!.toUri())
 
                     setIntent(
                         Intent(context, MainActivity::class.java)
@@ -394,6 +421,20 @@ class TvProviderWorker
                 }.build()
 
         companion object {
+            // Serializes publication and cleanup, including already running workers.
+            private val publicationMutex = Mutex()
+
+            suspend fun clearPrograms(context: Context) {
+                withContext(WholphinDispatchers.IO) {
+                    publicationMutex.withLock { clearProgramsUnlocked(context) }
+                }
+            }
+
+            private fun clearProgramsUnlocked(context: Context) {
+                context.contentResolver.delete(WatchNextPrograms.CONTENT_URI, null, null)
+                context.contentResolver.delete(TvContractCompat.PreviewPrograms.CONTENT_URI, null, null)
+            }
+
             const val WORK_NAME = "com.github.damontecres.wholphin.services.tvprovider.TvProviderWorker"
             const val PARAM_USER_ID = "userId"
             const val PARAM_SERVER_ID = "serverId"

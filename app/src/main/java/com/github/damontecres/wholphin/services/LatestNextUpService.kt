@@ -54,6 +54,7 @@ class LatestNextUpService
             limit: Int,
             includeEpisodes: Boolean,
             useSeriesForPrimary: Boolean = true,
+            apiClient: ApiClient = api,
         ): List<BaseItem> {
             val request =
                 GetResumeItemsRequest(
@@ -65,7 +66,7 @@ class LatestNextUpService
                     enableTotalRecordCount = false,
                 )
             val items =
-                api.itemsApi
+                apiClient.itemsApi
                     .getResumeItems(request)
                     .content
                     .items
@@ -83,8 +84,9 @@ class LatestNextUpService
             enableResumable: Boolean,
             maxDays: Int,
             useSeriesForPrimary: Boolean = true,
+            apiClient: ApiClient = api,
         ): List<BaseItem> {
-            val removedSeries = getRemovedFromNextUp(userId)
+            val removedSeries = getRemovedFromNextUp(userId, apiClient)
             val nextUpDateCutoff =
                 maxDays.takeIf { it > 0 }?.let { LocalDateTime.now().minusDays(it.toLong()) }
             val request =
@@ -101,7 +103,7 @@ class LatestNextUpService
                     enableTotalRecordCount = false,
                 )
             val nextUp =
-                api.tvShowsApi
+                apiClient.tvShowsApi
                     .getNextUp(request)
                     .content
                     .items
@@ -192,9 +194,12 @@ class LatestNextUpService
         /**
          * Get when series were removed from next up
          */
-        suspend fun getRemovedFromNextUp(userId: UUID): Map<UUID, LocalDateTime> =
+        suspend fun getRemovedFromNextUp(
+            userId: UUID,
+            apiClient: ApiClient = api,
+        ): Map<UUID, LocalDateTime> =
             displayPreferencesService
-                .getDisplayPreferences(userId)
+                .getDisplayPreferences(userId, apiClient = apiClient)
                 .customPrefs[REMOVED_KEY]
                 ?.let {
                     Json.decodeFromString<RemovedSeriesIds>(it).value

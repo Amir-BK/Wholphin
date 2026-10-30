@@ -82,6 +82,8 @@ sealed interface ScreensaverItem {
 
     data object Empty : ScreensaverItem
 
+    data object Neutral : ScreensaverItem
+
     data class CurrentItem(
         val item: BaseItem,
         val backdropUrl: String,
@@ -133,6 +135,14 @@ fun AppScreensaverContent(
             ),
         )
         when (currentItem) {
+            ScreensaverItem.Neutral -> {
+                ScreensaverPlaceholder(
+                    text = "Wholphin",
+                    duration = duration,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
             ScreensaverItem.Empty -> {
                 ScreensaverPlaceholder(
                     text = stringResource(R.string.no_results),

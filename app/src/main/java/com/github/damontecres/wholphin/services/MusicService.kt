@@ -33,6 +33,8 @@ import com.github.damontecres.wholphin.util.profile.supportedAudioCodecs
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
@@ -77,6 +79,7 @@ class MusicService
         private val api: ApiClient,
         private val playerFactory: PlayerFactory,
         private val serverRepository: ServerRepository,
+        private val profileLockService: ProfileLockService,
         private val imageUrlService: ImageUrlService,
         private val userPreferencesService: UserPreferencesService,
     ) {
@@ -106,6 +109,26 @@ class MusicService
         private var activityTracker: TrackActivityPlaybackListener? = null
         private var websocketJob: Job? = null
 
+        init {
+            defaultScope.launch {
+                profileLockService.locked.collect { request ->
+                    if (request != null) stop()
+                }
+            }
+            defaultScope.launch {
+                serverRepository.currentUserFlow.collect { user ->
+                    if (user?.isProtected != false) {
+                        mutex.withLock {
+                            onMain {
+                                mediaSession?.release()
+                                mediaSession = null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         private suspend fun preferAc3Surround() =
             userPreferencesService
                 .getCurrent()
@@ -118,11 +141,14 @@ class MusicService
          * Sets up the media session, activity tracking, and actual playback
          */
         suspend fun start() {
-            if (mediaSession == null) {
+            if (profileLockService.locked.value != null) return
+            if (activityTracker == null) {
                 mutex.withLock {
-                    if (mediaSession == null) {
+                    if (activityTracker == null) {
                         Timber.i("Starting music MediaSession")
-                        mediaSession = MediaSession.Builder(context, player).build()
+                        if (serverRepository.currentUser?.isProtected == false) {
+                            mediaSession = MediaSession.Builder(context, player).build()
+                        }
                         activityTracker =
                             TrackActivityPlaybackListener(api, player) {
                                 state.value.currentItemId?.let { itemId ->
@@ -138,8 +164,8 @@ class MusicService
                 }
             }
             onMain {
-                player.prepare()
-                player.play()
+                if (profileLockService.locked.value == null) player.prepare()
+                if (profileLockService.locked.value == null) player.play()
             }
         }
 
@@ -392,7 +418,7 @@ class MusicService
         suspend fun playIndex(index: Int) {
             onMain {
                 player.seekTo(index, 0L)
-                player.play()
+                if (profileLockService.locked.value == null) player.play()
             }
             // MusicPlayerListener will update state
         }
@@ -445,7 +471,7 @@ class MusicService
                                 }
 
                                 PlaystateCommand.UNPAUSE -> {
-                                    player.play()
+                                    if (profileLockService.locked.value == null) player.play()
                                 }
 
                                 PlaystateCommand.NEXT_TRACK -> {
@@ -473,7 +499,7 @@ class MusicService
                                 }
 
                                 PlaystateCommand.PLAY_PAUSE -> {
-                                    if (player.isPlaying) player.pause() else player.play()
+                                    if (player.isPlaying) player.pause() else if (profileLockService.locked.value == null) player.play()
                                 }
                             }
                         }

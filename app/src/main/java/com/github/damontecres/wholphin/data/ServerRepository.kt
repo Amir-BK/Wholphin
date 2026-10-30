@@ -191,6 +191,7 @@ class ServerRepository
             serverUrl: String,
             authenticationResult: AuthenticationResult,
             existingUser: JellyfinUser?,
+            preserveProfileProtection: Boolean = false,
         ) = withContext(ioDispatcher) {
             val accessToken = authenticationResult.accessToken
             if (accessToken != null) {
@@ -210,8 +211,8 @@ class ServerRepository
                             if (existingUser != null) {
                                 Timber.d("Re-using existing user")
                                 existingUser.copy(
-                                    // If the server authenticated via the server, always remove the PIN
-                                    pin = null,
+                                    // A screensaver challenge re-authenticates without changing profile protection.
+                                    pin = existingUser.pin.takeIf { preserveProfileProtection && existingUser.id == authedUser.id },
                                     accessToken = accessToken,
                                     lastUsed = ZonedDateTime.now(),
                                 )

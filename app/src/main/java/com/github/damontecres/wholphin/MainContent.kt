@@ -9,6 +9,10 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
+import com.github.damontecres.wholphin.ui.components.AppScreensaverContent
+import com.github.damontecres.wholphin.ui.components.ScreensaverItem
+import kotlin.time.Duration.Companion.seconds
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,64 +65,54 @@ fun MainContent(
         val interfaceCustomization =
             remember(userPreferences.appPreferences) { InterfaceCustomization(userPreferences.appPreferences) }
         CompositionLocalProvider(LocalInterfaceCustomization provides interfaceCustomization) {
-            NavDisplay(
-                backStack = backStack,
-                onBack = { backStack.removeLastOrNull() },
-                entryDecorators =
-                    listOf(
-                        rememberSaveableStateHolderNavEntryDecorator(),
-                        rememberViewModelStoreNavEntryDecorator(),
-                    ),
-                entryProvider = { key ->
-                    key as SetupDestination
-                    NavEntry(key) {
-                        when (key) {
-                            SetupDestination.Loading -> {
-                                Box(
-                                    modifier = Modifier.size(200.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    CircularProgressIndicator(
-                                        color = MaterialTheme.colorScheme.border,
-                                        modifier = Modifier.align(Alignment.Center),
-                                    )
-                                }
-                            }
-
-                            SetupDestination.ServerList -> {
-                                SwitchServerContent(Modifier.fillMaxSize())
-                            }
-
-                            is SetupDestination.UserList -> {
-                                SwitchUserContent(
-                                    server = key.server,
-                                    Modifier.fillMaxSize(),
-                                )
-                            }
-
-                            is SetupDestination.AppContent -> {
-                                LaunchedEffect(Unit) {
-                                    backdropService.clearBackdrop()
-                                }
-                                val current = key.current
-                                var showContent by remember {
-                                    mutableStateOf(true)
-                                }
-                                LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
-                                    if (!userPreferences.appPreferences.signInAutomatically) {
-                                        showContent = false
+            val lock by screensaverService.profileLockService.locked.collectAsState()
+            val screenSaverState by screensaverService.state.collectAsState()
+            if (lock != null) {
+                val request = lock!!
+                // Remove the protected navigation tree, including video surfaces and playback VMs.
+                LaunchedEffect(request) {
+                    backdropService.clearBackdrop()
+                    navigationManager.reloadHome()
+                }
+                Box(Modifier.fillMaxSize().background(Color.Black)) {
+                    if (screenSaverState.show) {
+                        AppScreensaverContent(ScreensaverItem.Neutral, true, 30.seconds, true, Modifier.fillMaxSize())
+                    } else {
+                        key(request) {
+                            NavDisplay(
+                                backStack = listOf(SetupDestination.UserList(request.current.server)),
+                                onBack = {},
+                                entryDecorators = listOf(
+                                    rememberSaveableStateHolderNavEntryDecorator(),
+                                    rememberViewModelStoreNavEntryDecorator(),
+                                ),
+                                entryProvider = { destination ->
+                                    NavEntry(destination) {
+                                        SwitchUserContent(
+                                            server = request.current.server,
+                                            modifier = Modifier.fillMaxSize(),
+                                            promptUser = request.current.user,
+                                        )
                                     }
-                                }
-
-                                if (showContent) {
-                                    ApplicationContent(
-                                        user = current.user,
-                                        server = current.server,
-                                        navigationManager = navigationManager,
-                                        preferences = preferences,
-                                        modifier = Modifier.fillMaxSize(),
-                                    )
-                                } else {
+                                },
+                            )
+                        }
+                    }
+                }
+            } else {
+                NavDisplay(
+                    backStack = backStack,
+                    onBack = { backStack.removeLastOrNull() },
+                    entryDecorators =
+                        listOf(
+                            rememberSaveableStateHolderNavEntryDecorator(),
+                            rememberViewModelStoreNavEntryDecorator(),
+                        ),
+                    entryProvider = { key ->
+                        key as SetupDestination
+                        NavEntry(key) {
+                            when (key) {
+                                SetupDestination.Loading -> {
                                     Box(
                                         modifier = Modifier.size(200.dp),
                                         contentAlignment = Alignment.Center,
@@ -129,13 +123,58 @@ fun MainContent(
                                         )
                                     }
                                 }
+
+                                SetupDestination.ServerList -> {
+                                    SwitchServerContent(Modifier.fillMaxSize())
+                                }
+
+                                is SetupDestination.UserList -> {
+                                    SwitchUserContent(
+                                        server = key.server,
+                                        Modifier.fillMaxSize(),
+                                    )
+                                }
+
+                                is SetupDestination.AppContent -> {
+                                    LaunchedEffect(Unit) {
+                                        backdropService.clearBackdrop()
+                                    }
+                                    val current = key.current
+                                    var showContent by remember {
+                                        mutableStateOf(true)
+                                    }
+                                    LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
+                                        if (!userPreferences.appPreferences.signInAutomatically) {
+                                            showContent = false
+                                        }
+                                    }
+
+                                    if (showContent) {
+                                        ApplicationContent(
+                                            user = current.user,
+                                            server = current.server,
+                                            navigationManager = navigationManager,
+                                            preferences = preferences,
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+                                    } else {
+                                        Box(
+                                            modifier = Modifier.size(200.dp),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            CircularProgressIndicator(
+                                                color = MaterialTheme.colorScheme.border,
+                                                modifier = Modifier.align(Alignment.Center),
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
-                    }
-                },
-            )
-            val screenSaverState by screensaverService.state.collectAsState()
-            if (screenSaverState.enabled || screenSaverState.enabledTemp) {
+                    },
+                )
+            }
+            if (lock == null && (screenSaverState.enabled || screenSaverState.enabledTemp)) {
                 AnimatedVisibility(
                     visible = screenSaverState.show,
                     enter = ScreensaverService.enterAnimation,
@@ -146,7 +185,7 @@ fun MainContent(
                 }
             }
             AnimatedVisibility(
-                visible = screenSaverState.showDim || (screenSaverState.dimEnabled && screenSaverState.show),
+                visible = lock == null && (screenSaverState.showDim || (screenSaverState.dimEnabled && screenSaverState.show)),
                 enter = ScreensaverService.enterAnimation,
                 exit = ScreensaverService.exitAnimation,
                 modifier = Modifier.fillMaxSize(),

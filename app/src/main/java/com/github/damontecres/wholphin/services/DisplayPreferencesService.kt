@@ -24,7 +24,8 @@ class DisplayPreferencesService
             userId: UUID,
             displayPreferencesId: String = DEFAULT_DISPLAY_PREF_ID,
             client: String = DEFAULT_CLIENT,
-        ) = api.displayPreferencesApi
+            apiClient: ApiClient = api,
+        ) = apiClient.displayPreferencesApi
             .getDisplayPreferences(
                 userId = userId,
                 displayPreferencesId = displayPreferencesId,

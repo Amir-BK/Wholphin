@@ -29,6 +29,9 @@ import com.github.damontecres.wholphin.services.PlaylistCreationResult
 import com.github.damontecres.wholphin.services.PlaylistCreator
 import com.github.damontecres.wholphin.services.RefreshRateService
 import com.github.damontecres.wholphin.services.ScreensaverService
+import com.github.damontecres.wholphin.services.ProfileLockService
+import kotlinx.coroutines.flow.MutableStateFlow
+import com.github.damontecres.wholphin.data.CurrentUser
 import com.github.damontecres.wholphin.services.StreamChoiceService
 import com.github.damontecres.wholphin.services.UserPreferencesService
 import com.github.damontecres.wholphin.test.TestTracks
@@ -171,6 +174,7 @@ class PlaybackViewModelTests {
     @OptIn(ExperimentalCoroutinesApi::class)
     @Before
     fun setUp() {
+        every { mockScreensaverService.profileLockService.locked } returns MutableStateFlow(null)
         WholphinDispatchers.configure(testDispatcher)
 
         every { mockApi.userLibraryApi } returns mockUserLibraryApi
@@ -274,6 +278,46 @@ class PlaybackViewModelTests {
             ?.let { throw it }
         return viewModel
     }
+
+    @Test
+    fun `Protected playback does not publish a system media session`() =
+        runTest(testDispatcher) {
+            setupPreferences { cinemaMode = false }
+            every { mockServerRepository.currentUser } returns user.copy(pin = "1234")
+            coEvery { mockUserLibraryApi.getItem(movie.id) } returns successResponse(movie)
+            createViewModel(Destination.Playback(movie.id, 0L))
+            verify(exactly = 0) { mockPlayerFactory.createMediaSession(any()) }
+        }
+
+    @Test
+    fun `Public playback keeps the system media session`() =
+        runTest(testDispatcher) {
+            every { mockServerRepository.currentUser } returns user.copy(pin = null, requireLogin = false)
+            setupPreferences { cinemaMode = false }
+            coEvery { mockUserLibraryApi.getItem(movie.id) } returns successResponse(movie)
+            createViewModel(Destination.Playback(movie.id, 0L))
+            verify(exactly = 1) { mockPlayerFactory.createMediaSession(any()) }
+        }
+
+    @Test
+    fun `Screensaver lock stops video without restoring its queue after authentication`() =
+        runTest(testDispatcher) {
+            setupPreferences { cinemaMode = false }
+            val lock = ProfileLockService(mockServerRepository)
+            every { mockServerRepository.current } returns MutableStateFlow(CurrentUser(server, user))
+            every { mockScreensaverService.profileLockService } returns lock
+            coEvery { mockUserLibraryApi.getItem(movie.id) } returns successResponse(movie)
+            createViewModel(Destination.Playback(movie.id, 0L))
+            lock.lockForScreensaver()
+            testScheduler.runCurrent()
+            verify { mockPlayer.pause() }
+            verify { mockPlayer.clearMediaItems() }
+            lock.authenticationSucceeded(lock.locked.value)
+            testScheduler.runCurrent()
+            Assert.assertNull(lock.locked.value)
+            verify(exactly = 1) { mockPlayer.clearMediaItems() }
+            verify(exactly = 1) { mockPlayer.play() }
+        }
 
     @Test
     fun `Play intro first`() =

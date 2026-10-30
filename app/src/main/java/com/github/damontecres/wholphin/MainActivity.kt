@@ -199,7 +199,7 @@ class MainActivity : AppCompatActivity() {
         viewModel.serverRepository.currentUserFlow
             .onEach { user ->
                 withContext(WholphinDispatchers.Main) {
-                    if (user?.hasPin == true) {
+                    if (user?.isProtected != false) {
                         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     } else {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -329,6 +329,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        // System dreams and screen-off may only pause the activity.
+        screensaverService.profileLockService.lockForScreensaver()
         super.onPause()
         Timber.d("onPause")
     }
@@ -387,7 +389,9 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         Timber.v("onNewIntent")
         setIntent(intent)
-        viewModel.appStart(intent)
+        if (screensaverService.profileLockService.locked.value == null) {
+            viewModel.appStart(intent)
+        }
     }
 
     fun changeDisplayMode(modeId: Int) {

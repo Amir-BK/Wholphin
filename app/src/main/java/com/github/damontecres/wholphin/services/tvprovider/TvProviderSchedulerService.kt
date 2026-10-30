@@ -44,13 +44,14 @@ class TvProviderSchedulerService
                 context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
 
         init {
-            serverRepository.current.collectLatestIn(activity.lifecycleScope) { user ->
+            serverRepository.currentUserFlow.collectLatestIn(activity.lifecycleScope) { user ->
                 workManager.cancelUniqueWork(TvProviderWorker.WORK_NAME)
                 if (supportsTvProvider) {
-                    if (user != null) {
+                    TvProviderWorker.clearPrograms(context)
+                    if (user != null && !user.isProtected) {
                         // Schedule a new worker whenever the user changes
                         activity.lifecycleScope.launchIO(ExceptionHandler()) {
-                            Timber.i("Scheduling TvProviderWorker for ${user.user}")
+                            Timber.i("Scheduling TvProviderWorker for ${user}")
                             workManager
                                 .enqueueUniquePeriodicWork(
                                     uniqueWorkName = TvProviderWorker.WORK_NAME,
@@ -63,8 +64,8 @@ class TvProviderSchedulerService
                                             15.minutes.toJavaDuration(),
                                         ).setInputData(
                                             workDataOf(
-                                                TvProviderWorker.PARAM_USER_ID to user.user.id.toString(),
-                                                TvProviderWorker.PARAM_SERVER_ID to user.server.id.toString(),
+                                                TvProviderWorker.PARAM_USER_ID to user.id.toString(),
+                                                TvProviderWorker.PARAM_SERVER_ID to user.serverId.toString(),
                                             ),
                                         ).setInitialDelay(60.seconds.toJavaDuration())
                                             .build(),
@@ -81,14 +82,14 @@ class TvProviderSchedulerService
         fun launchOneTimeRefresh() {
             if (supportsTvProvider) {
                 activity.lifecycleScope.launchIO(ExceptionHandler()) {
-                    serverRepository.current.value?.let { user ->
-                        Timber.i("Scheduling on-time TvProviderWorker for ${user.user}")
+                    serverRepository.currentUser?.takeUnless { it.isProtected }?.let { user ->
+                        Timber.i("Scheduling on-time TvProviderWorker for ${user}")
                         workManager.enqueue(
                             OneTimeWorkRequestBuilder<TvProviderWorker>()
                                 .setInputData(
                                     workDataOf(
-                                        TvProviderWorker.PARAM_USER_ID to user.user.id.toString(),
-                                        TvProviderWorker.PARAM_SERVER_ID to user.server.id.toString(),
+                                        TvProviderWorker.PARAM_USER_ID to user.id.toString(),
+                                        TvProviderWorker.PARAM_SERVER_ID to user.serverId.toString(),
                                     ),
                                 ).build(),
                         )

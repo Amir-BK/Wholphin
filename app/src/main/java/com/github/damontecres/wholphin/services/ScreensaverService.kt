@@ -1,6 +1,11 @@
 package com.github.damontecres.wholphin.services
 
 import android.content.Context
+import com.github.damontecres.wholphin.data.ServerRepository
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.combine
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -51,6 +56,8 @@ class ScreensaverService
         @param:ApplicationContext private val context: Context,
         @param:DefaultCoroutineScope private val scope: CoroutineScope,
         private val api: ApiClient,
+        private val serverRepository: ServerRepository,
+        val profileLockService: ProfileLockService,
         private val userPreferencesService: UserPreferencesService,
         private val imageUrlService: ImageUrlService,
     ) {
@@ -107,6 +114,8 @@ class ScreensaverService
                                     .getCurrent()
                                     .appPreferences.interfacePreferences.screensaverPreference.startDelay.milliseconds
                             delay(startDelay)
+                            if (_state.value.paused) return@launch
+                            profileLockService.lockForScreensaver()
                             _state.update {
                                 it.copy(
                                     active = true,
@@ -130,8 +139,13 @@ class ScreensaverService
                                     .appPreferences.interfacePreferences.screensaverPreference.startDelay.milliseconds
                             delay(startDelay)
                             Timber.v("state dim=%s", _state.value)
-                            _state.update {
-                                it.copy(dimActive = !_state.value.paused)
+                            if (!_state.value.paused) {
+                                profileLockService.lockForScreensaver()
+                                if (profileLockService.locked.value != null) {
+                                    start()
+                                } else {
+                                    _state.update { it.copy(dimActive = true) }
+                                }
                             }
                         }
                 }
@@ -142,10 +156,12 @@ class ScreensaverService
          * Immediately start the in-app screensaver
          */
         fun start() {
+            profileLockService.lockForScreensaver()
             _state.update {
                 it.copy(
                     enabledTemp = true,
                     active = true,
+                    paused = if (profileLockService.locked.value != null) false else it.paused,
                     dimActive = true,
                 )
             }
@@ -173,6 +189,8 @@ class ScreensaverService
          */
         fun keepScreenOn(keep: Boolean) {
             scope.launchDefault {
+                // Disposing playback when a lock begins must not dismiss the neutral saver.
+                if (profileLockService.locked.value != null && state.value.active) return@launchDefault
                 val screensaverEnabled = state.value.enabled
                 val dimEnabled = state.value.dimEnabled
                 Timber.d("Keep screen on: %s, screensaverEnabled=%s", keep, screensaverEnabled)
@@ -203,11 +221,28 @@ class ScreensaverService
         /**
          * Create a flow of items to show on the screensaver
          */
+        @OptIn(ExperimentalCoroutinesApi::class)
         fun createItemFlow(scope: CoroutineScope): Flow<ScreensaverItem?> =
+            serverRepository.currentUserFlow.combine(profileLockService.locked) { user, request ->
+                request?.current?.user ?: user
+            }.flatMapLatest { user ->
+                if (user == null || user.isProtected) {
+                    flowOf(if (user?.isProtected == true) ScreensaverItem.Neutral else ScreensaverItem.Empty)
+                } else {
+                    createPublicItemFlow(scope)
+                }
+            }
+
+        private fun createPublicItemFlow(scope: CoroutineScope): Flow<ScreensaverItem?> =
             flow {
+                emit(ScreensaverItem.Empty)
+                val current = serverRepository.current.value ?: return@flow
+                if (current.user.isProtected) return@flow
+                val api = serverRepository.jellyfin.createApi(baseUrl = current.server.url, accessToken = current.user.accessToken)
+                val imageUrlService = ImageUrlService(api)
                 val pager =
                     try {
-                        createPager()
+                        createPager(api, scope)
                     } catch (ex: Exception) {
                         Timber.e(ex, "Error creating pager for screensaver")
                         emit(ScreensaverItem.Error(ex))
@@ -275,7 +310,7 @@ class ScreensaverService
                 }
             }.flowOn(WholphinDispatchers.Default).cancellable()
 
-        private suspend fun createPager(): ApiRequestPager<GetItemsRequest> {
+        private suspend fun createPager(api: ApiClient, scope: CoroutineScope): ApiRequestPager<GetItemsRequest> {
             val prefs =
                 userPreferencesService.flow
                     .first()

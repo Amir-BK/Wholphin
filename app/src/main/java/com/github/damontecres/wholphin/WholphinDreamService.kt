@@ -23,6 +23,9 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.github.damontecres.wholphin.data.ServerRepository
+import com.github.damontecres.wholphin.data.CurrentUser
+import com.github.damontecres.wholphin.ui.components.ScreensaverItem
+import kotlin.time.Duration.Companion.seconds
 import com.github.damontecres.wholphin.preferences.AppPreferences
 import com.github.damontecres.wholphin.services.ScreensaverService
 import com.github.damontecres.wholphin.services.hilt.AuthOkHttpClient
@@ -32,6 +35,8 @@ import com.github.damontecres.wholphin.ui.launchDefault
 import com.github.damontecres.wholphin.ui.theme.WholphinTheme
 import com.github.damontecres.wholphin.ui.util.ProvideLocalClock
 import dagger.hilt.android.AndroidEntryPoint
+import com.github.damontecres.wholphin.util.WholphinDispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import okhttp3.OkHttpClient
@@ -76,7 +81,24 @@ class WholphinDreamService :
         lifecycleScope.launchDefault {
             if (serverRepository.current.value == null) {
                 val prefs = preferencesDataStore.data.first()
-                serverRepository.restoreSession(prefs.currentServerId.toUUIDOrNull(), prefs.currentUserId.toUUIDOrNull())
+                val serverId = prefs.currentServerId.toUUIDOrNull()
+                val userId = prefs.currentUserId.toUUIDOrNull()
+                val user = if (serverId != null && userId != null) {
+                    withContext(WholphinDispatchers.IO) {
+                        serverRepository.serverDao.getUser(serverId, userId)
+                    }
+                } else {
+                    null
+                }
+                if (user?.isProtected == true && serverId != null) {
+                    val server = withContext(WholphinDispatchers.IO) {
+                        serverRepository.serverDao.getServer(serverId)?.server
+                    }
+                    if (server != null) screensaverService.profileLockService.lockForScreensaver(CurrentUser(server, user))
+                }
+                if (user?.isProtected == false) {
+                    serverRepository.restoreSession(serverId, userId)
+                }
             }
         }
     }
@@ -91,7 +113,12 @@ class WholphinDreamService :
                 setViewTreeSavedStateRegistryOwner(this@WholphinDreamService)
                 setContent {
                     val user by serverRepository.currentUserFlow.collectAsState(null)
-                    if (user != null) {
+                    val lock by screensaverService.profileLockService.locked.collectAsState()
+                    if (lock != null || user?.isProtected != false) {
+                        WholphinTheme {
+                            AppScreensaverContent(ScreensaverItem.Neutral, false, 30.seconds, true, Modifier.fillMaxSize())
+                        }
+                    } else {
                         var prefs by remember { mutableStateOf<AppPreferences?>(null) }
                         LaunchedEffect(Unit) {
                             preferencesDataStore.data.collectLatest { prefs = it }
@@ -135,6 +162,7 @@ class WholphinDreamService :
 
     override fun onDreamingStarted() {
         super.onDreamingStarted()
+        screensaverService.profileLockService.lockForScreensaver()
         Timber.d("onDreamingStarted")
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
     }

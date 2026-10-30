@@ -11,6 +11,7 @@ import com.github.damontecres.wholphin.data.model.JellyfinServer
 import com.github.damontecres.wholphin.data.model.JellyfinUser
 import com.github.damontecres.wholphin.services.ImageUrlService
 import com.github.damontecres.wholphin.services.NavigationManager
+import com.github.damontecres.wholphin.services.ProfileLockService
 import com.github.damontecres.wholphin.services.SetupDestination
 import com.github.damontecres.wholphin.services.SetupNavigationManager
 import com.github.damontecres.wholphin.ui.launchDefault
@@ -56,6 +57,7 @@ class SwitchUserViewModel
         val navigationManager: NavigationManager,
         val setupNavigationManager: SetupNavigationManager,
         val imageUrlService: ImageUrlService,
+        private val profileLockService: ProfileLockService,
         @Assisted val server: JellyfinServer,
     ) : ViewModel() {
         @AssistedFactory
@@ -128,12 +130,14 @@ class SwitchUserViewModel
             }
         }
 
-        fun trySwitchUser(user: JellyfinUser): Deferred<SwitchUserResult> =
-            viewModelScope.async(WholphinDispatchers.IO) {
+        fun trySwitchUser(user: JellyfinUser): Deferred<SwitchUserResult> {
+            val lockRequest = profileLockService.locked.value
+            return viewModelScope.async(WholphinDispatchers.IO) {
                 try {
                     val current = serverRepository.changeUser(server, user)
                     navigationManager.reloadHome()
                     setupNavigationManager.navigateTo(SetupDestination.AppContent(current))
+                    profileLockService.authenticationSucceeded(lockRequest)
                     SwitchUserResult.Success
                 } catch (ex: InvalidStatusException) {
                     when (ex.status) {
@@ -163,6 +167,7 @@ class SwitchUserViewModel
                     SwitchUserResult.Error(ex.localizedMessage, true)
                 }
             }
+        }
 
         fun login(
             server: JellyfinServer,
@@ -171,6 +176,7 @@ class SwitchUserViewModel
             password: String,
         ) {
             quickConnectJob?.cancel()
+            val lockRequest = profileLockService.locked.value
             viewModelScope.launchIO {
                 try {
                     val api = jellyfin.createApi(baseUrl = server.url)
@@ -179,8 +185,10 @@ class SwitchUserViewModel
                         password = password,
                     )
                     val current =
-                        serverRepository.changeUser(server.url, authenticationResult, existingUser)
+                        serverRepository.changeUser(server.url, authenticationResult, existingUser, preserveProfileProtection = lockRequest != null || profileLockService.locked.value != null)
+                    if (lockRequest != null) navigationManager.reloadHome()
                     setupNavigationManager.navigateTo(SetupDestination.AppContent(current))
+                    profileLockService.authenticationSucceeded(lockRequest)
                 } catch (ex: Exception) {
                     Timber.e(ex, "Error logging in user")
                     if (ex is InvalidStatusException && ex.status == 401) {
@@ -197,6 +205,7 @@ class SwitchUserViewModel
             existingUser: JellyfinUser?,
         ) {
             quickConnectJob?.cancel()
+            val lockRequest = profileLockService.locked.value
             quickConnectJob =
                 viewModelScope.launchIO {
                     try {
@@ -225,8 +234,11 @@ class SwitchUserViewModel
                                 server.url,
                                 authenticationResult,
                                 existingUser,
+                                preserveProfileProtection = lockRequest != null || profileLockService.locked.value != null,
                             )
+                        if (lockRequest != null) navigationManager.reloadHome()
                         setupNavigationManager.navigateTo(SetupDestination.AppContent(current))
+                        profileLockService.authenticationSucceeded(lockRequest)
                     } catch (_: CancellationException) {
                         // no-op, user may have canceled
                     } catch (ex: Exception) {

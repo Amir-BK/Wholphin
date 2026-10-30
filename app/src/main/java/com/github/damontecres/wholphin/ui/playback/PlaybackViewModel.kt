@@ -87,6 +87,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
@@ -282,7 +283,26 @@ class PlaybackViewModel
                     player,
                     preferences.appPreferences.playbackPreferences,
                 )
-            mediaSession = playerFactory.createMediaSession(sessionPlayer)
+            // A MediaSession exposes titles and artwork to system UI and other apps.
+            if (serverRepository.currentUser?.isProtected == false) {
+                mediaSession = playerFactory.createMediaSession(sessionPlayer)
+            }
+            jobs.add(viewModelScope.launch {
+                screensaverService.profileLockService.locked.collect { request ->
+                    if (request != null) {
+                        player.pause()
+                        player.clearMediaItems()
+                    }
+                }
+            })
+            jobs.add(viewModelScope.launch {
+                serverRepository.currentUserFlow.collect { user ->
+                    if (user?.isProtected != false) {
+                        mediaSession?.release()
+                        mediaSession = null
+                    }
+                }
+            })
         }
 
         /**
@@ -597,8 +617,8 @@ class PlaybackViewModel
                         enableDirectPlay = !forceTranscoding,
                         enableDirectStream = !forceTranscoding,
                     )
-                    player.prepare()
-                    player.play()
+                    if (screensaverService.profileLockService.locked.value == null) player.prepare()
+                    if (screensaverService.profileLockService.locked.value == null) player.play()
                 }
                 listenForSegments(item.id)
                 return@withContext true
@@ -1406,8 +1426,8 @@ class PlaybackViewModel
                                 enableDirectStream = false,
                             )
                             withContext(WholphinDispatchers.Main) {
-                                player.prepare()
-                                player.play()
+                                if (screensaverService.profileLockService.locked.value == null) player.prepare()
+                                if (screensaverService.profileLockService.locked.value == null) player.play()
                             }
                         }
                     }
@@ -1464,7 +1484,7 @@ class PlaybackViewModel
                     }
 
                     PlaystateCommand.UNPAUSE -> {
-                        player.play()
+                        if (screensaverService.profileLockService.locked.value == null) player.play()
                     }
 
                     PlaystateCommand.NEXT_TRACK -> {
